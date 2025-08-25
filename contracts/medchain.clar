@@ -371,3 +371,507 @@
     (ok record)
   )
 )
+
+;; ===================
+;; PUBLIC FUNCTIONS - ADMINISTRATIVE
+;; ===================
+
+;; Verify a healthcare provider (admin only)
+(define-public (verify-provider (provider-id principal))
+  (let (
+    (provider (unwrap! (map-get? healthcare-providers { provider-id: provider-id }) ERR_PROVIDER_NOT_FOUND))
+  )
+    ;; Ensure only contract owner can verify providers
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    ;; Update provider verification status
+    (map-set healthcare-providers
+      { provider-id: provider-id }
+      (merge provider { is-verified: true })
+    )
+    
+    (print { event: "provider-verified", provider: provider-id, verified-by: tx-sender })
+    (ok true)
+  )
+)
+
+;; Deactivate a patient account (admin only - for compliance)
+(define-public (deactivate-patient (patient-id principal))
+  (let (
+    (patient (unwrap! (map-get? patients { patient-id: patient-id }) ERR_PATIENT_NOT_FOUND))
+  )
+    ;; Ensure only contract owner can deactivate patients
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    ;; Update patient status
+    (map-set patients
+      { patient-id: patient-id }
+      (merge patient { is-active: false })
+    )
+    
+    (print { event: "patient-deactivated", patient: patient-id, deactivated-by: tx-sender })
+    (ok true)
+  )
+)
+
+;; Emergency access to medical record (admin only - for critical situations)
+(define-public (emergency-access-record (record-id uint) (emergency-reason (string-ascii 200)))
+  (let (
+    (record (unwrap! (map-get? medical-records { record-id: record-id }) ERR_RECORD_NOT_FOUND))
+  )
+    ;; Ensure only contract owner can perform emergency access
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    ;; Log emergency access with detailed information
+    (print { 
+      event: "emergency-access", 
+      record-id: record-id,
+      accessed-by: tx-sender,
+      reason: emergency-reason,
+      patient: (get patient-id record),
+      accessed-at: block-height
+    })
+    (ok record)
+  )
+)
+
+;; ===================
+;; PUBLIC FUNCTIONS - ADVANCED CONSENT FEATURES
+;; ===================
+
+;; Batch grant consent to multiple providers (convenience function)
+(define-public (batch-grant-consent
+    (providers (list 5 { provider: principal, duration: uint, permissions: uint, purpose: (string-ascii 200) }))
+  )
+  (let (
+    (patient (unwrap! (map-get? patients { patient-id: tx-sender }) ERR_PATIENT_NOT_FOUND))
+  )
+    (fold process-consent-grant providers (ok (list)))
+  )
+)
+
+;; Helper function for batch consent processing
+(define-private (process-consent-grant 
+    (consent-data { provider: principal, duration: uint, permissions: uint, purpose: (string-ascii 200) })
+    (acc (response (list 5 uint) uint))
+  )
+  (let (
+    (result (grant-consent 
+      (get provider consent-data)
+      (get duration consent-data)
+      (get permissions consent-data)
+      (get purpose consent-data)
+    ))
+  )
+    (match result
+      success (ok (unwrap-panic (as-max-len? (append (unwrap-panic acc) success) u5)))
+      error (err error)
+    )
+  )
+)
+
+;; Create time-limited emergency consent (patient can pre-authorize emergency access)
+(define-public (create-emergency-consent
+    (emergency-contact principal)
+    (duration-blocks uint)
+    (conditions (string-ascii 200))
+  )
+  (let (
+    (patient (unwrap! (map-get? patients { patient-id: tx-sender }) ERR_PATIENT_NOT_FOUND))
+    (consent-id (generate-consent-id))
+    (capped-duration (if (<= duration-blocks MAX_CONSENT_DURATION) duration-blocks MAX_CONSENT_DURATION))
+    (expires-at (+ block-height capped-duration))
+  )
+    ;; Create emergency consent with full permissions
+    (map-set consent-forms
+      { patient-id: tx-sender, provider-id: emergency-contact }
+      {
+        consent-id: consent-id,
+        granted-at: block-height,
+        expires-at: expires-at,
+        permissions: u15, ;; All permissions for emergency situations
+        purpose: conditions,
+        is-active: true,
+        revoked-at: none
+      }
+    )
+    
+    (print { 
+      event: "emergency-consent-created", 
+      patient: tx-sender, 
+      emergency-contact: emergency-contact,
+      consent-id: consent-id,
+      expires-at: expires-at
+    })
+    (ok consent-id)
+  )
+)
+
+;; ===================
+;; READ-ONLY FUNCTIONS - DATA QUERIES
+;; ===================
+
+;; Get patient information
+(define-read-only (get-patient-info (patient-id principal))
+  (map-get? patients { patient-id: patient-id })
+)
+
+;; Get healthcare provider information
+(define-read-only (get-provider-info (provider-id principal))
+  (map-get? healthcare-providers { provider-id: provider-id })
+)
+
+;; Get consent information between patient and provider
+(define-read-only (get-consent-info (patient-id principal) (provider-id principal))
+  (map-get? consent-forms { patient-id: patient-id, provider-id: provider-id })
+)
+
+;; Get medical record information
+(define-read-only (get-record-info (record-id uint))
+  (map-get? medical-records { record-id: record-id })
+)
+
+;; Check if consent is currently valid
+(define-read-only (check-consent-validity (patient-id principal) (provider-id principal))
+  (match (map-get? consent-forms { patient-id: patient-id, provider-id: provider-id })
+    consent-data (is-consent-valid consent-data)
+    false
+  )
+)
+
+;; Get consent expiration time
+(define-read-only (get-consent-expiration (patient-id principal) (provider-id principal))
+  (match (map-get? consent-forms { patient-id: patient-id, provider-id: provider-id })
+    consent-data (some (get expires-at consent-data))
+    none
+  )
+)
+
+;; Check specific permission level for a provider
+(define-read-only (has-consent-permission (patient-id principal) (provider-id principal) (required-permission uint))
+  (match (map-get? consent-forms { patient-id: patient-id, provider-id: provider-id })
+    consent-data (and 
+      (is-consent-valid consent-data)
+      (has-permission (get permissions consent-data) required-permission)
+    )
+    false
+  )
+)
+
+;; Get total number of active consents for a patient
+(define-read-only (get-patient-consent-count (patient-id principal))
+  ;; This would require iteration in a full implementation
+  ;; For now, return a placeholder - in practice, this would be tracked separately
+  u0
+)
+
+;; Validate if provider is verified and active
+(define-read-only (is-provider-verified (provider-id principal))
+  (match (map-get? healthcare-providers { provider-id: provider-id })
+    provider-data (get is-verified provider-data)
+    false
+  )
+)
+
+;; ===================
+;; AUDIT TRAIL AND ANALYTICS
+;; ===================
+
+;; Access log for comprehensive audit trails
+(define-map access-logs
+  { log-id: uint }
+  {
+    accessor: principal,
+    record-id: uint,
+    access-type: (string-ascii 20),
+    timestamp: uint,
+    patient-id: principal,
+    purpose: (string-ascii 200)
+  }
+)
+
+;; Provider activity statistics
+(define-map provider-stats
+  { provider-id: principal }
+  {
+    records-created: uint,
+    records-accessed: uint,
+    active-consents: uint,
+    last-activity: uint
+  }
+)
+
+;; Patient activity statistics
+(define-map patient-stats
+  { patient-id: principal }
+  {
+    consents-granted: uint,
+    consents-revoked: uint,
+    records-created: uint,
+    last-activity: uint
+  }
+)
+
+;; Global system statistics
+(define-data-var total-patients uint u0)
+(define-data-var total-providers uint u0)
+(define-data-var total-consents uint u0)
+(define-data-var total-records uint u0)
+(define-data-var access-log-counter uint u0)
+
+;; Log access attempts for audit purposes
+(define-private (log-access
+    (accessor principal)
+    (record-id uint)
+    (access-type (string-ascii 20))
+    (patient-id principal)
+    (purpose (string-ascii 200))
+  )
+  (let (
+    (log-id (var-get access-log-counter))
+  )
+    (var-set access-log-counter (+ log-id u1))
+    (map-set access-logs
+      { log-id: log-id }
+      {
+        accessor: accessor,
+        record-id: record-id,
+        access-type: access-type,
+        timestamp: block-height,
+        patient-id: patient-id,
+        purpose: purpose
+      }
+    )
+    log-id
+  )
+)
+
+;; Update provider statistics
+(define-private (update-provider-stats (provider-id principal) (activity-type (string-ascii 20)))
+  (let (
+    (current-stats (default-to
+      { records-created: u0, records-accessed: u0, active-consents: u0, last-activity: u0 }
+      (map-get? provider-stats { provider-id: provider-id })
+    ))
+  )
+    (if (is-eq activity-type "record-created")
+      (map-set provider-stats
+        { provider-id: provider-id }
+        (merge current-stats {
+          records-created: (+ (get records-created current-stats) u1),
+          last-activity: block-height
+        })
+      )
+      (if (is-eq activity-type "record-accessed")
+        (map-set provider-stats
+          { provider-id: provider-id }
+          (merge current-stats {
+            records-accessed: (+ (get records-accessed current-stats) u1),
+            last-activity: block-height
+          })
+        )
+        false
+      )
+    )
+  )
+)
+
+;; Update patient statistics
+(define-private (update-patient-stats (patient-id principal) (activity-type (string-ascii 20)))
+  (let (
+    (current-stats (default-to
+      { consents-granted: u0, consents-revoked: u0, records-created: u0, last-activity: u0 }
+      (map-get? patient-stats { patient-id: patient-id })
+    ))
+  )
+    (if (is-eq activity-type "consent-granted")
+      (map-set patient-stats
+        { patient-id: patient-id }
+        (merge current-stats {
+          consents-granted: (+ (get consents-granted current-stats) u1),
+          last-activity: block-height
+        })
+      )
+      (if (is-eq activity-type "consent-revoked")
+        (map-set patient-stats
+          { patient-id: patient-id }
+          (merge current-stats {
+            consents-revoked: (+ (get consents-revoked current-stats) u1),
+            last-activity: block-height
+          })
+        )
+        false
+      )
+    )
+  )
+)
+
+;; ===================
+;; ENHANCED PUBLIC FUNCTIONS WITH ANALYTICS
+;; ===================
+
+;; Enhanced record access with comprehensive logging
+(define-public (access-medical-record-enhanced (record-id uint) (access-purpose (string-ascii 200)))
+  (let (
+    (record (unwrap! (map-get? medical-records { record-id: record-id }) ERR_RECORD_NOT_FOUND))
+    (patient-id (get patient-id record))
+    (consent (unwrap! (map-get? consent-forms { patient-id: patient-id, provider-id: tx-sender }) ERR_CONSENT_EXPIRED))
+    (log-id (log-access tx-sender record-id "read" patient-id access-purpose))
+  )
+    ;; Ensure consent is valid and includes read permission
+    (asserts! (is-consent-valid consent) ERR_CONSENT_EXPIRED)
+    (asserts! (has-permission (get permissions consent) PERMISSION_READ) ERR_ACCESS_DENIED)
+    
+    ;; Update statistics
+    (update-provider-stats tx-sender "record-accessed")
+    
+    ;; Log the access for audit trail
+    (print { 
+      event: "record-accessed-enhanced", 
+      record-id: record-id,
+      provider: tx-sender,
+      patient: patient-id,
+      purpose: access-purpose,
+      log-id: log-id,
+      accessed-at: block-height
+    })
+    (ok { record: record, log-id: log-id })
+  )
+)
+
+;; Bulk consent status check (for provider dashboards)
+(define-public (bulk-consent-check (patient-ids (list 10 principal)))
+  (let (
+    (provider-id tx-sender)
+  )
+    ;; Ensure caller is a verified provider
+    (asserts! (is-provider-verified provider-id) ERR_NOT_AUTHORIZED)
+    
+    (ok (map check-patient-consent patient-ids))
+  )
+)
+
+;; Helper function for bulk consent checking
+(define-private (check-patient-consent (patient-id principal))
+  (let (
+    (consent-exists (map-get? consent-forms { patient-id: patient-id, provider-id: tx-sender }))
+  )
+    {
+      patient: patient-id,
+      has-consent: (is-some consent-exists),
+      is-valid: (match consent-exists
+        consent-data (is-consent-valid consent-data)
+        false
+      )
+    }
+  )
+)
+
+;; Generate comprehensive audit report (admin only)
+(define-public (generate-audit-report (start-block uint) (end-block uint))
+  (begin
+    ;; Ensure only admin can generate reports
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    
+    ;; Validate time range
+    (asserts! (<= start-block end-block) ERR_INVALID_TIME_RANGE)
+    (asserts! (<= end-block block-height) ERR_INVALID_TIME_RANGE)
+    
+    (print {
+      event: "audit-report-generated",
+      generated-by: tx-sender,
+      start-block: start-block,
+      end-block: end-block,
+      generated-at: block-height,
+      total-patients: (var-get total-patients),
+      total-providers: (var-get total-providers),
+      total-consents: (var-get total-consents),
+      total-records: (var-get total-records)
+    })
+    
+    (ok {
+      start-block: start-block,
+      end-block: end-block,
+      total-patients: (var-get total-patients),
+      total-providers: (var-get total-providers),
+      total-consents: (var-get total-consents),
+      total-records: (var-get total-records)
+    })
+  )
+)
+
+;; ===================
+;; ADDITIONAL READ-ONLY ANALYTICS FUNCTIONS
+;; ===================
+
+;; Get provider statistics
+(define-read-only (get-provider-statistics (provider-id principal))
+  (map-get? provider-stats { provider-id: provider-id })
+)
+
+;; Get patient statistics
+(define-read-only (get-patient-statistics (patient-id principal))
+  (map-get? patient-stats { patient-id: patient-id })
+)
+
+;; Get global system statistics
+(define-read-only (get-system-statistics)
+  {
+    total-patients: (var-get total-patients),
+    total-providers: (var-get total-providers),
+    total-consents: (var-get total-consents),
+    total-records: (var-get total-records),
+    current-block: block-height
+  }
+)
+
+;; Get access log entry
+(define-read-only (get-access-log (log-id uint))
+  (map-get? access-logs { log-id: log-id })
+)
+
+;; Check if patient has any active consents
+(define-read-only (has-active-consents (patient-id principal))
+  ;; In a full implementation, this would iterate through consents
+  ;; For now, we return a placeholder - would be implemented with proper indexing
+  false
+)
+
+;; Get consent details with full validation status
+(define-read-only (get-detailed-consent-info (patient-id principal) (provider-id principal))
+  (match (map-get? consent-forms { patient-id: patient-id, provider-id: provider-id })
+    consent-data (some {
+      consent: consent-data,
+      is-valid: (is-consent-valid consent-data),
+      blocks-until-expiry: (if (>= (get expires-at consent-data) block-height)
+        (- (get expires-at consent-data) block-height)
+        u0
+      ),
+      has-read: (has-permission (get permissions consent-data) PERMISSION_READ),
+      has-write: (has-permission (get permissions consent-data) PERMISSION_WRITE),
+      has-delete: (has-permission (get permissions consent-data) PERMISSION_DELETE),
+      has-admin: (has-permission (get permissions consent-data) PERMISSION_ADMIN)
+    })
+    none
+  )
+)
+
+;; Contract version and metadata
+(define-read-only (get-contract-info)
+  {
+    name: "MedChain",
+    version: "1.0.0",
+    description: "HIPAA-compliant healthcare consent and medical record management",
+    deployed-at: u1, ;; Would be set during deployment
+    owner: CONTRACT_OWNER,
+    features: (list
+      "Patient Registration"
+      "Provider Verification" 
+      "Consent Management"
+      "Medical Records"
+      "Emergency Access"
+      "Audit Trails"
+      "Analytics"
+    )
+  }
+)
