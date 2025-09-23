@@ -445,7 +445,7 @@ Clarinet.test({
         ]);
         
         assertEquals(setupBlock.receipts.length, 4);
-        assertEquals(setupBlock.receipts[3].result, '(ok true)');
+        assertEquals(setupBlock.receipts[3].result.startsWith('(ok u'), true);
         
         // Revoke the consent
         let revokeBlock = chain.mineBlock([
@@ -534,14 +534,14 @@ Clarinet.test({
         ]);
         
         assertEquals(setupBlock.receipts.length, 4);
-        assertEquals(setupBlock.receipts[3].result, '(ok true)');
+        assertEquals(setupBlock.receipts[3].result.startsWith('(ok u'), true);
         
         // Update consent with expanded permissions
         let updateBlock = chain.mineBlock([
             Tx.contractCall('medchain', 'update-consent', [
                 types.principal(provider1.address),
-                types.uint(1500), // Extended duration
                 types.uint(7), // READ + WRITE + DELETE permissions
+                types.uint(1500), // Extended duration
                 types.ascii("Expanded treatment authorization")
             ], patient1.address)
         ]);
@@ -591,7 +591,7 @@ Clarinet.test({
         ]);
         
         assertEquals(setupBlock.receipts.length, 4);
-        assertEquals(setupBlock.receipts[3].result, '(ok true)');
+        assertEquals(setupBlock.receipts[3].result.startsWith('(ok u'), true);
         
         // Check initial consent validity (should be valid)
         let validityCheck1 = chain.callReadOnlyFn('medchain', 'check-consent-validity', 
@@ -690,7 +690,7 @@ Clarinet.test({
             ], patient1.address)
         ]);
         
-        assertEquals(batchConsentBlock.receipts[0].result, '(ok true)');
+        assertEquals(batchConsentBlock.receipts[0].result.startsWith('(ok [u'), true);
         
         // Verify all providers received consent
         let consent1 = chain.callReadOnlyFn('medchain', 'get-consent-info', 
@@ -706,5 +706,470 @@ Clarinet.test({
         assertEquals(consent1.result.includes('permissions: u3'), true);
         assertEquals(consent2.result.includes('permissions: u3'), true);
         assertEquals(consent3.result.includes('permissions: u3'), true);
+    },
+});
+
+// ===================
+// COMMIT 3: MEDICAL RECORD CREATION AND ACCESS CONTROL TESTS
+// ===================
+
+// Test Suite 6: Medical Record Creation and Management
+Clarinet.test({
+    name: "Successfully create medical record with proper authorization",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Register patient, verified provider, and grant consent
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000), // Duration
+                types.uint(2), // WRITE permission
+                types.ascii("Medical record creation")
+            ], patient1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 4);
+        assertEquals(setupBlock.receipts[3].result.startsWith('(ok u'), true);
+        
+        // Create medical record
+        let recordBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Blood Test Results"),
+                types.buff(new ArrayBuffer(32)), // 32-byte hash
+                types.uint(2), // Access level: WRITE
+                types.bool(false) // Not sensitive
+            ], provider1.address)
+        ]);
+        
+        assertEquals(recordBlock.receipts[0].result.startsWith('(ok u'), true); // Returns record ID
+        
+        // Verify record was created (using ID 0 as first record)
+        let recordInfo = chain.callReadOnlyFn('medchain', 'get-record-info', 
+            [types.uint(0)], // First record has ID 0
+            deployer.address);
+        
+        assertEquals(recordInfo.result.includes('record-type: "Blood Test Results"'), true);
+        assertEquals(recordInfo.result.includes('is-sensitive: false'), true);
+    },
+});
+
+Clarinet.test({
+    name: "Fail to create medical record without proper consent",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Register patient and verified provider, but NO consent granted
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 3);
+        
+        // Attempt to create medical record without consent - should fail
+        let recordBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Unauthorized Record"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(2),
+                types.bool(false)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(recordBlock.receipts[0].result, '(err u103)'); // ERR_CONSENT_EXPIRED (no consent found)
+    },
+});
+
+Clarinet.test({
+    name: "Fail to create medical record with insufficient permissions",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Register patient, verified provider, and grant READ-only consent
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(1), // READ-only permission (no WRITE)
+                types.ascii("Read-only access")
+            ], patient1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 4);
+        
+        // Attempt to create medical record with only READ permission - should fail
+        let recordBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Unauthorized Write"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(2),
+                types.bool(false)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(recordBlock.receipts[0].result, '(err u107)'); // ERR_ACCESS_DENIED
+    },
+});
+
+// Test Suite 7: Medical Record Access and Security
+Clarinet.test({
+    name: "Successfully access medical record with proper permissions",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Complete setup with record creation
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(3), // READ + WRITE permissions
+                types.ascii("Full access for treatment")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Cardiology Report"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(1), // READ access level
+                types.bool(false)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 5);
+        
+        // Access the medical record
+        let accessBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'access-medical-record', [
+                types.uint(0) // Record ID 0 (first record)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(accessBlock.receipts[0].result, '(ok true)');
+    },
+});
+
+Clarinet.test({
+    name: "Fail to access medical record without proper permissions",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        const provider2 = accounts.get('wallet_3')!;
+        
+        // Setup: Create record accessible to provider1 only
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Johnson"),
+                types.ascii("MD67890"),
+                types.ascii("Dermatologist"),
+                types.ascii("Metro Medical Center")
+            ], provider2.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider2.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(3), // READ + WRITE permissions for provider1
+                types.ascii("Cardiology access")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Cardiology Report"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(1),
+                types.bool(false)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 7);
+        
+        // Provider2 attempts to access the record without consent - should fail
+        let accessBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'access-medical-record', [
+                types.uint(1)
+            ], provider2.address)
+        ]);
+        
+        assertEquals(accessBlock.receipts[0].result, '(err u103)'); // ERR_CONSENT_EXPIRED (no consent found)
+    },
+});
+
+Clarinet.test({
+    name: "Successfully access medical record with enhanced logging",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Complete setup
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(1), // READ permission
+                types.ascii("Medical consultation")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Lab Results"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(1),
+                types.bool(false)
+            ], provider1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 5);
+        
+        // Use enhanced access function with purpose logging
+        let accessBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'access-medical-record-enhanced', [
+                types.uint(1),
+                types.ascii("Treatment planning consultation")
+            ], provider1.address)
+        ]);
+        
+        assertEquals(accessBlock.receipts[0].result, '(ok true)');
+    },
+});
+
+// Test Suite 8: Emergency Access and Special Cases
+Clarinet.test({
+    name: "Successfully perform emergency access to medical records",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        const emergencyProvider = accounts.get('wallet_3')!;
+        
+        // Setup: Create patient and record, but no consent for emergency provider
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Emergency"),
+                types.ascii("EMD99999"),
+                types.ascii("Emergency Medicine"),
+                types.ascii("Emergency Hospital")
+            ], emergencyProvider.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(emergencyProvider.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(2), // WRITE permission
+                types.ascii("Regular care")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Critical Lab Results"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(1),
+                types.bool(true) // Sensitive record
+            ], provider1.address)
+        ]);
+        
+        assertEquals(setupBlock.receipts.length, 7);
+        
+        // Emergency provider accesses record in emergency situation
+        let emergencyBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'emergency-access-record', [
+                types.uint(1),
+                types.ascii("Life-threatening emergency - patient unconscious, need medical history")
+            ], emergencyProvider.address)
+        ]);
+        
+        assertEquals(emergencyBlock.receipts[0].result, '(ok true)');
+    },
+});
+
+Clarinet.test({
+    name: "Test comprehensive record information retrieval",
+    async fn(chain: Chain, accounts: Map<string, Account>) {
+        const deployer = accounts.get('deployer')!;
+        const patient1 = accounts.get('wallet_1')!;
+        const provider1 = accounts.get('wallet_2')!;
+        
+        // Setup: Create multiple records with different properties
+        let setupBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'register-patient', [
+                types.ascii("Jane Doe"),
+                types.uint(19900101),
+                types.ascii("Emergency Contact: John Doe"),
+                types.ascii("MRN-54321")
+            ], patient1.address),
+            Tx.contractCall('medchain', 'register-provider', [
+                types.ascii("Dr. Smith"),
+                types.ascii("MD12345"),
+                types.ascii("Cardiologist"),
+                types.ascii("City General Hospital")
+            ], provider1.address),
+            Tx.contractCall('medchain', 'verify-provider', [
+                types.principal(provider1.address)
+            ], deployer.address),
+            Tx.contractCall('medchain', 'grant-consent', [
+                types.principal(provider1.address),
+                types.uint(1000),
+                types.uint(6), // WRITE + DELETE permissions
+                types.ascii("Comprehensive medical care")
+            ], patient1.address)
+        ]);
+        
+        // Create multiple records with different characteristics
+        let recordsBlock = chain.mineBlock([
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Blood Work"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(1), // READ level
+                types.bool(false) // Not sensitive
+            ], provider1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("Psychiatric Evaluation"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(4), // DELETE level
+                types.bool(true) // Sensitive
+            ], provider1.address),
+            Tx.contractCall('medchain', 'create-medical-record', [
+                types.principal(patient1.address),
+                types.ascii("X-Ray Results"),
+                types.buff(new ArrayBuffer(32)),
+                types.uint(2), // WRITE level
+                types.bool(false) // Not sensitive
+            ], provider1.address)
+        ]);
+        
+        assertEquals(recordsBlock.receipts.length, 3);
+        
+        // Verify different record properties
+        let record1 = chain.callReadOnlyFn('medchain', 'get-record-info', 
+            [types.uint(1)], deployer.address);
+        let record2 = chain.callReadOnlyFn('medchain', 'get-record-info', 
+            [types.uint(2)], deployer.address);
+        let record3 = chain.callReadOnlyFn('medchain', 'get-record-info', 
+            [types.uint(3)], deployer.address);
+        
+        assertEquals(record1.result.includes('record-type: "Blood Work"'), true);
+        assertEquals(record1.result.includes('is-sensitive: false'), true);
+        
+        assertEquals(record2.result.includes('record-type: "Psychiatric Evaluation"'), true);
+        assertEquals(record2.result.includes('is-sensitive: true'), true);
+        
+        assertEquals(record3.result.includes('record-type: "X-Ray Results"'), true);
+        assertEquals(record3.result.includes('access-level: u2'), true);
     },
 });
