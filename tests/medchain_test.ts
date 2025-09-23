@@ -1159,20 +1159,20 @@ Clarinet.test({
         assertEquals(recordsBlock.receipts.length, 3);
         
         // Verify different record properties
+        let record0 = chain.callReadOnlyFn('medchain', 'get-record-info', 
+            [types.uint(0)], deployer.address);
         let record1 = chain.callReadOnlyFn('medchain', 'get-record-info', 
             [types.uint(1)], deployer.address);
         let record2 = chain.callReadOnlyFn('medchain', 'get-record-info', 
             [types.uint(2)], deployer.address);
-        let record3 = chain.callReadOnlyFn('medchain', 'get-record-info', 
-            [types.uint(3)], deployer.address);
         
-        assertEquals(record1.result.includes('record-type: "Blood Work"'), true);
-        assertEquals(record1.result.includes('is-sensitive: false'), true);
+        assertEquals(record0.result.includes('record-type: "Blood Work"'), true);
+        assertEquals(record0.result.includes('is-sensitive: false'), true);
         
-        assertEquals(record2.result.includes('record-type: "Psychiatric Evaluation"'), true);
-        assertEquals(record2.result.includes('is-sensitive: true'), true);
+        assertEquals(record1.result.includes('record-type: "Psychiatric Evaluation"'), true);
+        assertEquals(record1.result.includes('is-sensitive: true'), true);
         
-        assertEquals(record3.result.includes('record-type: "X-Ray Results"'), true);
-        assertEquals(record3.result.includes('access-level: u2'), true);
+        assertEquals(record2.result.includes('record-type: "X-Ray Results"'), true);
+        assertEquals(record2.result.includes('access-level: u2'), true);
     },
 });
